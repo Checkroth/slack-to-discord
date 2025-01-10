@@ -36,6 +36,7 @@ setup(
         "discord.py>=2.0.0,<3.0.0",
         "urllib3>=1.26.12,<3.0.0",
         "iterable-io>=1.0.0,<2.0.0",
+        "peewee>=3.17.8"
     ],
     packages=["slack_to_discord"],
     entry_points={
