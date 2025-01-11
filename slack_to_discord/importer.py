@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 
+from typing import Any
 from pathlib import Path
+import asyncio
 import contextlib
 import functools
 import glob
@@ -466,7 +468,27 @@ class SlackImportClient(discord.Client):
 
         return sent
 
-    async def _import_channel(self, chan_name: str, init_topic: str, pins: list, is_private: bool) -> state.ChannelImportState:
+    async def _import_channel(
+            self,
+            chan_name: str,
+            init_topic: str,
+            pins: list,
+            is_private: bool,
+            c_msg: int,
+            c_chan: int,
+            emoji_map: dict[str, str],
+            existing_channels: dict,
+            g: Any,  # What is "g"? Some sort of client, but can't find the type.
+            ) -> state.ChannelImportState:
+        """
+        Per-channel loop implementation as an async function.
+        Will create the channel if it doesn't exist.
+        Will post every target message for a channel to the corresponding channel in discord.
+
+        Refactor point: The argument list is huge due to this function being lifted out of a larger function
+            with a much wider shared context (_run_import). It would be cleaner to make some of these,
+            particulary the client (g) and the counters (c_msg, c_chan) attributes of the class instead of shared parameters.
+        """
         ch = None
         ch_webhook, ch_send = None, None
         c_msg_start = c_msg
@@ -517,8 +539,13 @@ class SlackImportClient(discord.Client):
                     ch = existing_channels[chan_name]
                 c_chan += 1
 
+                channel_webhook_name = f"s2d-importer-{chan_name}"
+                for webhook in await g.webhooks():
+                    if webhook.user == self.user and webhook.name == channel_webhook_name:
+                        __log__.info("Cleaning up previous webhook %s", channel_webhook_name)
+                        await webhook.delete()
                 ch_webhook = await ch.create_webhook(
-                    name="s2d-importer",
+                    name=channel_webhook_name,
                     reason="For importing messages into '#{}'".format(chan_name)
                 )
                 ch_send = functools.partial(ch_webhook.send, wait=True)
@@ -559,8 +586,8 @@ class SlackImportClient(discord.Client):
                 finally:
                     await thread.edit(archived=True)
 
-                # calculate next date separator based on the last message sent to the main channel
-                self._prev_msg = msg
+            # calculate next date separator based on the last message sent to the main channel
+            self._prev_msg = msg
 
         if ch_webhook:
             await ch_webhook.delete()
@@ -578,7 +605,6 @@ class SlackImportClient(discord.Client):
         return channel_state
 
 
->>>>>>> 7bdf8cb (fixup! Previous import state management)
     async def _run_import(self, g):
         emoji_map = {x.name: str(x) for x in self.emojis}
 
@@ -587,126 +613,36 @@ class SlackImportClient(discord.Client):
 
         existing_channels = {x.name: x for x in g.text_channels}
 
+        # TODO:: Delete this block -- webhook create/delete has moved to channel processing
         for webhook in await g.webhooks():
             if webhook.user == self.user and webhook.name == "s2d-importer":
                 __log__.info("Cleaning up previous webhook %s", webhook)
                 await webhook.delete()
+        # -------------------------------------------------------------------------
 
+        import_tasks = []
         for chan_name, init_topic, pins, is_private in slack_channels(self._data_dir):
             if self._channels is not None and chan_name.lower() not in self._channels:
                 __log__.info("Skipping channel '#%s' - not in the list of channels to import", chan_name)
                 continue
+            import_tasks.append(asyncio.create_task(
+                self._import_channel(
+                    chan_name,
+                    init_topic,
+                    pins,
+                    is_private,
+                    c_msg,
+                    c_chan,
+                    emoji_map,
+                    existing_channels,
+                    g,
+                )))
 
-            ch = None
-            ch_webhook, ch_send = None, None
-            c_msg_start = c_msg
+        for import_task in import_tasks:
+            await import_task
+            result = import_task.result()
+            IMPORT_STATE[result.channel_name] = result
 
-            self._prev_msg = None  # always start with the date in a new channel
-
-            init_topic = emoji_replace(init_topic, emoji_map)
-
-            __log__.info("Processing channel '#%s'...", chan_name)
-
-            channel_import_state = IMPORT_STATE.get(chan_name)
-            if channel_import_state:
-                previous_import_last_message = channel_import_state.last_message
-            else:
-                previous_import_last_message = None
-            if previous_import_last_message:
-                previous_import_end_time = datetime.strptime(
-                    f"{previous_import_last_message.date} {previous_import_last_message.time}",
-                    f"{DATE_FORMAT} {TIME_FORMAT}"
-                )
-            else:
-                previous_import_end_time = None
-            
-            for msg in slack_channel_messages(self._data_dir, chan_name, self._users, emoji_map, pins):
-                # skip messages that are too early, stop when messages are too late
-                if self._end and msg["datetime"].date() > self._end:
-                    break
-                elif self._start and  msg["datetime"].date() < self._start:
-                    continue
-                elif previous_import_end_time and msg["datetime"] < previous_import_end_time:
-                    # Skip messages that are from before the last import attempt's final synced message
-                    continue
-
-                # Now that we have a message to send, get/create the channel to send it to
-                if ch is None:
-                    if chan_name not in existing_channels:
-                        if self._all_private or is_private:
-                            __log__.info("Creating '#%s' as a private channel", chan_name)
-                            overwrites = {
-                                g.default_role: discord.PermissionOverwrite(read_messages=False),
-                                g.me: discord.PermissionOverwrite(read_messages=True),
-                            }
-                            ch = await g.create_text_channel(chan_name, topic=init_topic, overwrites=overwrites)
-                        else:
-                            __log__.info("Creating '#%s' as a public channel", chan_name)
-                            ch = await g.create_text_channel(chan_name, topic=init_topic)
-                    else:
-                        ch = existing_channels[chan_name]
-                    c_chan += 1
-
-                    ch_webhook = await ch.create_webhook(
-                        name="s2d-importer",
-                        reason="For importing messages into '#{}'".format(chan_name)
-                    )
-                    ch_send = functools.partial(ch_webhook.send, wait=True)
-
-                topic = msg["events"].get("topic", None)
-                if topic is not None and topic != ch.topic:
-                    # Note that the ratelimit is pretty extreme for this
-                    # (2 edits per 10 minutes) so it may take a while if there
-                    # a lot of topic changes
-                    await ch.edit(topic=topic)
-
-                # Send message and threaded replies
-                await self._handle_date_sep(ch, msg)
-                sent = await self._send_slack_msg(ch_send, msg)
-                c_msg += 1
-                last_message = 
-                IMPORT_STATE[chan_name] = state.ChannelImportState(
-                    channel_name=chan_name,
-                    completed=False,
-                    last_message=state.Message(
-                        user_id=msg["userinfo"]["user_id"],
-                        date=msg["date"],
-                        time=msg["time"],
-                        text=msg["text"]
-                    )
-                )
-
-                if sent and msg["replies"]:
-                    thread_name = (
-                        textwrap.wrap(msg.get("text") or "", max_lines=1, width=MAX_THREADNAME_SIZE, placeholder="…") or
-                        [BACKUP_THREAD_NAME.format(**msg).replace(":", "-")]  # ':' is not allowed in thread names
-                    )[0]
-                    thread = await sent.create_thread(name=thread_name)
-                    try:
-                        thread_send = functools.partial(ch_send, thread=thread)
-                        for rmsg in msg["replies"]:
-                            await self._handle_date_sep(thread, rmsg)
-                            await self._send_slack_msg(thread_send, rmsg)
-                            c_msg += 1
-                    finally:
-                        await thread.edit(archived=True)
-
-                    # calculate next date separator based on the last message sent to the main channel
-                    self._prev_msg = msg
-
-            if ch_webhook:
-                await ch_webhook.delete()
-            channel_state = IMPORT_STATE.get(chan_name)
-            if channel_state:
-                IMPORT_STATE[chan_name].completed = True
-            else:
-                IMPORT_STATE[chan_name] = state.ChannelImportState(
-                    channel_name=chan_name,
-                    last_message=None,
-                    completed=True,
-                )
-
-            __log__.info("Imported %s messages into '#%s'", c_msg - c_msg_start, chan_name)
         __log__.info(
             "Finished importing %d messages into %d channel(s) in %s",
             c_msg,
@@ -734,5 +670,6 @@ def run_import(*, zipfile, token, **kwargs):
         __log__.info("Logging the bot into Discord")
         client = SlackImportClient(data_dir=t, **kwargs)
         client.run(token, reconnect=False, log_handler=None)
+        state.store_import_state(kwargs.get("state_file"), IMPORT_STATE)
         if client._exception:
             raise client._exception
