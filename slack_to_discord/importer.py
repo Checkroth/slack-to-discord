@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+from pathlib import Path
 import contextlib
 import functools
 import glob
@@ -19,6 +20,7 @@ from discord.errors import Forbidden
 
 from slack_to_discord.http_stream import CachedSeekableHTTPStream
 from slack_to_discord.emojis import GLOBAL_EMOJI_MAP
+from slack_to_discord import state
 
 
 # Discord size limits
@@ -41,6 +43,8 @@ DATE_SEPARATOR = "`{:-^30}`"
 MENTION_RE = re.compile(r"<([@!#])([^>]*?)(?:\|([^>]*?))?>")
 LINK_RE = re.compile(r"<((?:https?|mailto|tel):[A-Za-z0-9_\+\.\-\/\?\,\=\#\:\@\(\)]+)\|([^>]+)>")
 EMOJI_RE = re.compile(r":([^ /<>:]+):(?::skin-tone-(\d):)?")
+
+IMPORT_STATE = {}
 
 
 
@@ -462,6 +466,119 @@ class SlackImportClient(discord.Client):
 
         return sent
 
+    async def _import_channel(self, chan_name: str, init_topic: str, pins: list, is_private: bool) -> state.ChannelImportState:
+        ch = None
+        ch_webhook, ch_send = None, None
+        c_msg_start = c_msg
+
+        self._prev_msg = None  # always start with the date in a new channel
+
+        init_topic = emoji_replace(init_topic, emoji_map)
+
+        __log__.info("Processing channel '#%s'...", chan_name)
+
+        channel_import_state = IMPORT_STATE.get(chan_name)
+        if channel_import_state:
+            previous_import_last_message = channel_import_state.last_message
+        else:
+            previous_import_last_message = None
+        if previous_import_last_message:
+            previous_import_end_time = datetime.strptime(
+                f"{previous_import_last_message.date} {previous_import_last_message.time}",
+                f"{DATE_FORMAT} {TIME_FORMAT}"
+            )
+        else:
+            previous_import_end_time = None
+        
+        for msg in slack_channel_messages(self._data_dir, chan_name, self._users, emoji_map, pins):
+            # skip messages that are too early, stop when messages are too late
+            if self._end and msg["datetime"].date() > self._end:
+                break
+            elif self._start and  msg["datetime"].date() < self._start:
+                continue
+            elif previous_import_end_time and msg["datetime"] < previous_import_end_time:
+                # Skip messages that are from before the last import attempt's final synced message
+                continue
+
+            # Now that we have a message to send, get/create the channel to send it to
+            if ch is None:
+                if chan_name not in existing_channels:
+                    if self._all_private or is_private:
+                        __log__.info("Creating '#%s' as a private channel", chan_name)
+                        overwrites = {
+                            g.default_role: discord.PermissionOverwrite(read_messages=False),
+                            g.me: discord.PermissionOverwrite(read_messages=True),
+                        }
+                        ch = await g.create_text_channel(chan_name, topic=init_topic, overwrites=overwrites)
+                    else:
+                        __log__.info("Creating '#%s' as a public channel", chan_name)
+                        ch = await g.create_text_channel(chan_name, topic=init_topic)
+                else:
+                    ch = existing_channels[chan_name]
+                c_chan += 1
+
+                ch_webhook = await ch.create_webhook(
+                    name="s2d-importer",
+                    reason="For importing messages into '#{}'".format(chan_name)
+                )
+                ch_send = functools.partial(ch_webhook.send, wait=True)
+
+            topic = msg["events"].get("topic", None)
+            if topic is not None and topic != ch.topic:
+                # Note that the ratelimit is pretty extreme for this
+                # (2 edits per 10 minutes) so it may take a while if there
+                # a lot of topic changes
+                await ch.edit(topic=topic)
+
+            # Send message and threaded replies
+            await self._handle_date_sep(ch, msg)
+            sent = await self._send_slack_msg(ch_send, msg)
+            c_msg += 1
+            channel_state = state.ChannelImportState(
+                channel_name=chan_name,
+                completed=False,
+                last_message=state.Message(
+                    date=msg["date"],
+                    time=msg["time"],
+                    text=msg["text"]
+                )
+            )
+
+            if sent and msg["replies"]:
+                thread_name = (
+                    textwrap.wrap(msg.get("text") or "", max_lines=1, width=MAX_THREADNAME_SIZE, placeholder="…") or
+                    [BACKUP_THREAD_NAME.format(**msg).replace(":", "-")]  # ':' is not allowed in thread names
+                )[0]
+                thread = await sent.create_thread(name=thread_name)
+                try:
+                    thread_send = functools.partial(ch_send, thread=thread)
+                    for rmsg in msg["replies"]:
+                        await self._handle_date_sep(thread, rmsg)
+                        await self._send_slack_msg(thread_send, rmsg)
+                        c_msg += 1
+                finally:
+                    await thread.edit(archived=True)
+
+                # calculate next date separator based on the last message sent to the main channel
+                self._prev_msg = msg
+
+        if ch_webhook:
+            await ch_webhook.delete()
+        channel_state = IMPORT_STATE.get(chan_name)
+        if channel_state:
+            channel_state.completed = True
+        else:
+            channel_state = state.ChannelImportState(
+                channel_name=chan_name,
+                last_message=None,
+                completed=True,
+            )
+
+        __log__.info("Imported %s messages into '#%s'", c_msg - c_msg_start, chan_name)
+        return channel_state
+
+
+>>>>>>> 7bdf8cb (fixup! Previous import state management)
     async def _run_import(self, g):
         emoji_map = {x.name: str(x) for x in self.emojis}
 
@@ -490,11 +607,27 @@ class SlackImportClient(discord.Client):
 
             __log__.info("Processing channel '#%s'...", chan_name)
 
+            channel_import_state = IMPORT_STATE.get(chan_name)
+            if channel_import_state:
+                previous_import_last_message = channel_import_state.last_message
+            else:
+                previous_import_last_message = None
+            if previous_import_last_message:
+                previous_import_end_time = datetime.strptime(
+                    f"{previous_import_last_message.date} {previous_import_last_message.time}",
+                    f"{DATE_FORMAT} {TIME_FORMAT}"
+                )
+            else:
+                previous_import_end_time = None
+            
             for msg in slack_channel_messages(self._data_dir, chan_name, self._users, emoji_map, pins):
                 # skip messages that are too early, stop when messages are too late
                 if self._end and msg["datetime"].date() > self._end:
                     break
                 elif self._start and  msg["datetime"].date() < self._start:
+                    continue
+                elif previous_import_end_time and msg["datetime"] < previous_import_end_time:
+                    # Skip messages that are from before the last import attempt's final synced message
                     continue
 
                 # Now that we have a message to send, get/create the channel to send it to
@@ -531,6 +664,18 @@ class SlackImportClient(discord.Client):
                 await self._handle_date_sep(ch, msg)
                 sent = await self._send_slack_msg(ch_send, msg)
                 c_msg += 1
+                last_message = 
+                IMPORT_STATE[chan_name] = state.ChannelImportState(
+                    channel_name=chan_name,
+                    completed=False,
+                    last_message=state.Message(
+                        user_id=msg["userinfo"]["user_id"],
+                        date=msg["date"],
+                        time=msg["time"],
+                        text=msg["text"]
+                    )
+                )
+
                 if sent and msg["replies"]:
                     thread_name = (
                         textwrap.wrap(msg.get("text") or "", max_lines=1, width=MAX_THREADNAME_SIZE, placeholder="…") or
@@ -551,6 +696,15 @@ class SlackImportClient(discord.Client):
 
             if ch_webhook:
                 await ch_webhook.delete()
+            channel_state = IMPORT_STATE.get(chan_name)
+            if channel_state:
+                IMPORT_STATE[chan_name].completed = True
+            else:
+                IMPORT_STATE[chan_name] = state.ChannelImportState(
+                    channel_name=chan_name,
+                    last_message=None,
+                    completed=True,
+                )
 
             __log__.info("Imported %s messages into '#%s'", c_msg - c_msg_start, chan_name)
         __log__.info(
@@ -563,6 +717,8 @@ class SlackImportClient(discord.Client):
 
 def run_import(*, zipfile, token, **kwargs):
     __log__.info("Extracting Slack export zip")
+    IMPORT_STATE = state.load_import_state(kwargs.get("state_file"))
+    
     with tempfile.TemporaryDirectory() as t:
         with ZipFile(zipfile, "r") as z:
             # Non-ASCII filenames in the zip seem to be encoded using UTF-8, but don't set the flag

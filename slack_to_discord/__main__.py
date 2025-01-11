@@ -19,6 +19,7 @@ def main():
     parser.add_argument("-e", "--end", help="The date to end importing at (YYYY-MM-DD)", required=False, default=None)
     parser.add_argument("-p", "--all-private", help="Import all channels as private channels in Discord", action="store_true", default=False)
     parser.add_argument("-r", "--real-names", help="Use real names from Slack instead of usernames", action="store_true", default=False)
+    parser.add_argument("-i", "--import-state-file", help="Specify the state file to prevent duplicate operations. Default is `slack_to_discord_import_state.json`", action="store_true", required=False)
     parser.add_argument("-v", "--verbose", help="Show more verbose logs", action="store_true")
     args = parser.parse_args()
 
@@ -33,6 +34,7 @@ def main():
         real_names=args.real_names,
         start=args.start,
         end=args.end,
+        state_file=args.import_state_file
     )
 
 if __name__ == "__main__":
